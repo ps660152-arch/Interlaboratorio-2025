@@ -1,0 +1,232 @@
+"""
+Análisis Interlaboratorio – Cálculo de Pruebas H, K y Z-score (Estudio conocido como ST1 o Estudio 1)
+Autor: Diego Pastor Sanchez
+Descripción:
+Este script procesa diferentes propiedades fotométricas medidas por múltiples laboratorios 
+(LENS_0, LENS_1, etc.) a partir de un archivo Excel. Para cada hoja se calcula:
+
+- Promedio y desviación estándar por laboratorio
+- Prueba H de Mandel
+- Prueba K de Mandel
+- Z-score y clasificación estadística
+- Exportación de resultados y gráficas para cada hoja
+
+Como se menciona en el título, debido a la forma en como se evalúan los resultados siguiendo la norma 17025, este es el primero de 2 estudios que se han de realizar,
+en este se analizan todos los laboratorios, es decir, no se han quitado los laboratorios o participantes que tengan datos atípicos o diferentes a todos los demás
+
+"""
+
+# ==========================
+#   Importación de librerías
+# ==========================
+
+import pandas as pd
+import numpy as np
+import math
+import matplotlib.pyplot as plt
+from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as OpenpyxlImage
+import seaborn as sns
+
+# =======================================
+#   Configuración de archivo de entrada
+# =======================================
+
+Nombre_archivo = '/content/Item 1 estudio ST1 modificado.xlsx'
+
+# Hojas que se analizarán dentro del archivo Excel
+hojas = [
+    'Eficacia Luminosa',
+    'Temperatura de Color',
+    'Flujo luminoso',
+    'Indice de Rendimiento',
+    'Factor de Potencia',
+    'Distorsion Armonica',
+    'Factor de Potencia'  # Duplicada, se mantiene para no alterar el flujo original
+]
+
+# Diccionario donde se guardarán las tablas finales por hoja
+resultados_dict = {}
+
+# =======================================
+#   Procesamiento por cada hoja del Excel
+# =======================================
+
+for hoja in hojas:
+
+    # ===============================
+    #   Lectura y limpieza del sheet
+    # ===============================
+    df = pd.read_excel(Nombre_archivo, sheet_name=hoja)
+
+    # La primera fila contiene los nombres reales de las columnas
+    df.columns = df.iloc[0].astype(str)
+    df = df[1:].reset_index(drop=True)
+
+    # Extraer solo columnas que correspondan a laboratorios LENS
+    lenses_data = {
+        col: pd.to_numeric(df[col], errors='coerce').dropna()
+        for col in df.columns if "LENS" in col
+    }
+
+    # Eliminar columnas vacías
+    lenses_data = {col: data for col, data in lenses_data.items() if not data.empty}
+
+    if len(lenses_data) == 0:
+        print(f"No hay datos válidos para la hoja {hoja}. Se omite el cálculo.")
+        continue
+
+    # ============================================================
+    #   Cálculo de estadísticas básicas por laboratorio (Prom y SD)
+    # ============================================================
+    estadisticas = {
+        col: {
+            "Promedio": lenses_data[col].mean(),
+            "Desviación estándar": lenses_data[col].std()
+        }
+        for col in lenses_data
+    }
+
+    # Datos globales entre laboratorios
+    promedios_lenses = [stats["Promedio"] for stats in estadisticas.values()]
+    gran_promedio = np.mean(promedios_lenses)
+    desviacion_promedios = np.std(promedios_lenses, ddof=1)
+
+    todos_los_datos = np.concatenate([lenses_data[col].values for col in lenses_data])
+    Gran_desviacion_estandar = np.std(todos_los_datos, ddof=1)
+
+    # ======================
+    #   Prueba H de Mandel
+    # ======================
+    PruebaH = {
+        col: (stats['Promedio'] - gran_promedio) / desviacion_promedios
+        for col, stats in estadisticas.items()
+    }
+
+    # ======================
+    #   Prueba K de Mandel
+    # ======================
+    # Cálculos intermedios según norma ISO 5725
+    n_mediciones = len(next(iter(lenses_data.values())))
+    valor_S2r = sum((stats["Desviación estándar"] ** 2) for stats in estadisticas.values()) / n_mediciones
+    valor_S2d = n_mediciones * (desviacion_promedios ** 2)
+    valor_S2L = (valor_S2d - valor_S2r) / n_mediciones
+    valor_S2_R = valor_S2r + valor_S2L
+    valor_raiz_s2 = math.sqrt(sum((stats["Desviación estándar"] ** 2) for stats in estadisticas.values()))
+
+    PruebaK = {
+        col: (stats["Desviación estándar"] * math.sqrt(len(lenses_data))) / valor_raiz_s2
+        for col, stats in estadisticas.items()
+    }
+
+    # ======================
+    #     Prueba Z-score
+    # ======================
+    PruebaZcore = {
+        col: abs((stats['Promedio'] - gran_promedio) / Gran_desviacion_estandar)
+        for col, stats in estadisticas.items()
+    }
+
+    # Clasificación estándar Z-score
+    clasificacion = {
+        col: (
+            "S (Satisfactorio)" if z <= 2 else
+            "C (Cuestionable)" if z < 3 else
+            "NS (No Satisfactorio)"
+        )
+        for col, z in PruebaZcore.items()
+    }
+
+    # ======================
+    #      Impresión
+    # ======================
+    print(f"\nResultados de las pruebas para {hoja}:")
+    print(f"{'Laboratorio':<15} {'Prueba H':<12} {'Prueba K':<12}")
+    print("-" * 40)
+
+    for col in PruebaH:
+        print(f"{col:<15} {PruebaH[col]:<12.6f} {PruebaK[col]:<12.6f}")
+
+    print("\nClasificación Z-score:")
+    for col, resultado in clasificacion.items():
+        print(f"{col}: {resultado}")
+
+    # ======================
+    #   Gráficas H y K
+    # ======================
+
+    # ---- Gráfica H ----
+    plt.figure(figsize=(10, 6))
+    plt.bar(PruebaH.keys(), PruebaH.values(), color='royalblue', alpha=0.7)
+    plt.axhline(y=1.85, color='red', linestyle='--')
+    plt.axhline(y=2.30, color='orange', linestyle='--')
+    plt.axhline(y=-1.85, color='red', linestyle='--')
+    plt.axhline(y=-2.30, color='orange', linestyle='--')
+    plt.xlabel("Laboratorios (LENS)")
+    plt.ylabel("Valor de Prueba H")
+    plt.title(f"Prueba H para {hoja}")
+    plt.xticks(rotation=45)
+    plt.grid(axis='y', linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(f"prueba_h_{hoja}.png", dpi=300)
+    plt.close()
+
+    # ---- Gráfica K ----
+    plt.figure(figsize=(10, 6))
+    plt.bar(PruebaK.keys(), PruebaK.values(), color='seagreen', alpha=0.7)
+    plt.axhline(y=1.52, color='red', linestyle='--')
+    plt.axhline(y=1.76, color='orange', linestyle='--')
+    plt.xlabel("Laboratorios (LENS)")
+    plt.ylabel("Valor de Prueba K")
+    plt.title(f"Prueba K para {hoja}")
+    plt.xticks(rotation=45)
+    plt.grid(axis='y', linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(f"prueba_k_{hoja}.png", dpi=300)
+    plt.close()
+
+    # ===================================================================================
+    #   Construcción de tabla final que se exportará a Excel (incluye M1 a M5 y métricas)
+    # ===================================================================================
+    df_resultados = pd.DataFrame({
+        f"M{i+1}": {col: lenses_data[col].iloc[i] for col in lenses_data}
+        for i in range(5)  # M1–M5
+    })
+
+    df_resultados["Promedio"] = {col: estadisticas[col]["Promedio"] for col in estadisticas}
+    df_resultados["Desviación estándar"] = {col: estadisticas[col]["Desviación estándar"] for col in estadisticas}
+    df_resultados["h"] = {col: PruebaH[col] for col in PruebaH}
+    df_resultados["k"] = {col: PruebaK[col] for col in PruebaK}
+    df_resultados["Z-Score"] = {col: PruebaZcore[col] for col in PruebaZcore}
+    df_resultados["Clasificación Z-Score"] = {col: clasificacion[col] for col in clasificacion}
+
+    df_resultados = df_resultados.round(4)
+    resultados_dict[hoja] = df_resultados.T
+
+# =======================================
+#   Guardar todas las hojas en un Excel
+# =======================================
+
+ruta_excel = "Resultados Estudio General (ST1) item 1.xlsx"
+
+with pd.ExcelWriter(ruta_excel, engine='openpyxl') as writer:
+    for hoja in resultados_dict:
+        resultados_dict[hoja].to_excel(writer, sheet_name=hoja, index=True)
+
+# =======================================
+#   Insertar imágenes en cada hoja
+# =======================================
+
+wb = load_workbook(ruta_excel)
+
+for hoja in resultados_dict:
+    ws = wb[hoja]
+
+    img_h = OpenpyxlImage(f"prueba_h_{hoja}.png")
+    img_k = OpenpyxlImage(f"prueba_k_{hoja}.png")
+
+    ws.add_image(img_h, "J2")
+    ws.add_image(img_k, "J35")
+
+wb.save(ruta_excel)
+
