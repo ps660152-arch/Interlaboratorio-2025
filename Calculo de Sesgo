@@ -1,0 +1,386 @@
+"""
+
+Análisis Interlaboratorio – Cálculo de Sesgo
+Autor: Diego Pastor Sanchez
+Descripción:
+Este script procesa diferentes propiedades fotométricas medidas por múltiples laboratorios 
+(LENS_0, LENS_1, etc.) a partir de un archivo Excel. Para cada hoja se calcula:
+
+- Calculo de Sesgo
+
+"""
+
+import os
+import math
+import shutil
+import re
+import textwrap
+import numpy as np
+import pandas as pd
+from scipy.stats import t
+import matplotlib.pyplot as plt
+
+from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.utils import column_index_from_string, get_column_letter
+
+# =============== CONFIG ===============
+EXCEL_IN  = '/content/Item 1 estudio ST2 .xlsx'
+EXCEL_OUT = '/content/Prueba 9.xlsx'
+
+# Hojas/magnitudes a procesar (nombres EXACTOS)
+hojas = [
+    'Eficacia Luminosa',
+    'Temperatura de Color',
+    'Flujo luminoso',
+    'Indice de Rendimiento',
+    'Factor de Potencia',
+    'Distorsion Armonica',
+]
+
+# Valor de referencia por magnitud (OBLIGATORIO: edita con tus valores)
+x_ref_por_hoja = {
+    'Eficacia Luminosa': 94.34476,
+    'Temperatura de Color': 6457.417,
+    'Flujo luminoso': 4445.625,
+    'Indice de Rendimiento': 84.53543,
+    'Factor de Potencia': 0.920918,
+    'Distorsion Armonica': 41.24891,
+}
+
+# Incertidumbre estándar del valor de referencia (OPCIONAL; 0.0 si no aplica)
+u_ref_por_hoja = {h: 0.0 for h in hojas}
+
+# Dónde anclar y cuántas celdas ocupar (imagen compacta)
+anchor_cell_default = 'C15'  # celda superior-izquierda donde se insertará la imagen
+cells_wide = 10              # ancho en columnas
+cells_high = 20              # alto en filas
+extra_header_px = 60         # espacio extra para el encabezado
+dpi = 180                    # resolución de render de la imagen
+
+# Carpeta temporal para PNG
+carpeta_png = '/content/tablas_sesgo_png'
+os.makedirs(carpeta_png, exist_ok=True)
+
+# ======= utilidades tamaño en Excel =======
+def colwidth_to_pixels(width_char):
+    """
+    Convertir el ancho de columna (en caracteres de Excel) a píxeles aproximados.
+    Esto ayuda a dimensionar las imágenes que se colocarán dentro de una hoja de Excel.
+    """
+    if width_char is None:
+        width_char = 8.43
+    return int(round((width_char * 7) + 5))
+
+
+def rowheight_to_pixels(height_points):
+    """
+    Convertir la altura de fila (en puntos) a píxeles aproximados.
+    """
+    if height_points is None:
+        height_points = 15.0
+    return int(round(height_points * (4.0 / 3.0)))
+
+
+def range_pixels(ws, anchor_cell, cols, rows):
+    """
+    Calcular el ancho y alto (en píxeles) ocupados por un rango de celdas
+    comenzando en `anchor_cell`, con `cols` columnas y `rows` filas.
+    Usa las dimensiones definidas en la hoja `ws`.
+    """
+    m = re.match(r"^([A-Z]+)(\d+)$", anchor_cell.upper())
+    if not m:
+        raise ValueError(f"Anchor inválido: {anchor_cell}")
+    col_letter, row_str = m.groups()
+    c0 = column_index_from_string(col_letter)
+    r0 = int(row_str)
+
+    width_px = 0
+    for c in range(c0, c0 + cols):
+        letter = get_column_letter(c)
+        # Si la columna no tiene width definido, colwidth_to_pixels retornará valor por defecto.
+        width_px += colwidth_to_pixels(ws.column_dimensions[letter].width)
+
+    height_px = 0
+    for r in range(r0, r0 + rows):
+        # Si la fila no tiene height definido, rowheight_to_pixels retornará valor por defecto.
+        height_px += rowheight_to_pixels(ws.row_dimensions[r].height)
+
+    return width_px, height_px
+
+
+# ======= utilidades varias =======
+def fmt(x, dec=6):
+    """
+    Formateo compacto para mostrar valores:
+    - Si es NaN o inf, muestra '—'
+    - Si dec == 0 y es posible, muestra como entero
+    - En otro caso, devuelve con dec decimales
+    """
+    if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
+        return '—'
+    if dec == 0:
+        try:
+            return f"{int(x)}"
+        except Exception:
+            return f"{x:.{dec}f}"
+    return f"{x:.{dec}f}"
+
+
+def wrap_text(s, width=28):
+    """
+    Envuelve un texto con saltos de línea para que quepa en la tarjeta PNG.
+    """
+    try:
+        return "\n".join(textwrap.wrap(str(s), width=width, break_long_words=False))
+    except Exception:
+        return s
+
+
+# ======= render de tarjeta compacta (tabla expandida a lo ancho) =======
+def render_card_png(titulo, pares, out_png, width_px, height_px, dpi=180):
+    """
+    Renderiza una tarjeta PNG con un encabezado y una tabla simple (2 columnas):
+    - `titulo`: texto del encabezado (puede tener saltos de línea)
+    - `pares`: lista de tuplas (concepto, valor)
+    - `out_png`: ruta salida PNG
+    - `width_px`, `height_px`: tamaño en píxeles que ocupará la imagen
+    """
+    import matplotlib.pyplot as plt
+
+    fig_w = width_px / dpi
+    fig_h = height_px / dpi
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
+
+    # ================== HEADER ==================
+    header_h = 0.22
+    ax_header = fig.add_axes([0.02, 1 - header_h - 0.02, 0.96, header_h])
+    ax_header.set_axis_off()
+
+    ax_header.add_patch(plt.Rectangle((0, 0), 1, 1,
+                                      facecolor='#1f4e79',
+                                      edgecolor='black', lw=0.8))
+
+    ax_header.text(0.5, 0.5, titulo, ha='center', va='center',
+                   color='white', fontsize=11, fontweight='bold', wrap=True)
+
+    # ================== TABLA ==================
+    ax_tbl = fig.add_axes([0.02, 0.06, 0.96, 1 - header_h - 0.11])
+    ax_tbl.set_axis_off()
+
+    # --- Prepara datos ---
+    data = []
+    for concepto, valor in pares:
+        valor = str(valor)
+        data.append([concepto, valor])
+
+    tbl = ax_tbl.table(
+        cellText=data,
+        colLabels=['Concepto', 'Valor'],
+        colWidths=[0.55, 0.45],
+        bbox=[0, 0, 1, 1],
+        edges='horizontal'
+    )
+
+    # ================== ESTILOS ==================
+    tbl.auto_set_font_size(False)
+
+    for (r, c), cell in tbl.get_celld().items():
+
+        try:
+            cell.set_pad(0.28)
+        except Exception:
+            pass
+
+        cell.set_linewidth(0.6)
+        cell.set_fontsize(9)
+
+        # ------- ENCABEZADOS -------
+        if r == 0:
+            cell.set_facecolor('#e9edf3')
+            cell.set_text_props(weight='bold', ha='center')
+
+        # ------- CONTENIDO --------
+        else:
+            if c == 0:
+                # Concepto → izquierda
+                cell.set_text_props(ha='left')
+            else:
+                # Valor → CENTRADO
+                cell.set_text_props(ha='center')
+
+    tbl.scale(1.0, 1.20)
+
+    plt.savefig(out_png, pad_inches=0.28)
+    plt.close(fig)
+
+
+# =============== cálculo de métricas por hoja ===============
+tmp_results = {}
+
+for hoja in hojas:
+    # Validación: Si no hay referencia definida, avisar y omitir hoja
+    if hoja not in x_ref_por_hoja:
+        print(f"[AVISO] Falta x_ref para '{hoja}'. Omitida.")
+        continue
+
+    x_ref = float(x_ref_por_hoja[hoja])
+    u_ref = float(u_ref_por_hoja.get(hoja, 0.0))
+
+    # Leer hoja con encabezado por defecto (header=0)
+    df_raw = pd.read_excel(EXCEL_IN, sheet_name=hoja, header=0, dtype=object)
+
+    # Detectar si la primera fila contiene los encabezados reales (p. ej. 'LENS1')
+    cols_upper = [str(c).upper() for c in df_raw.columns.astype(str)]
+    first_row_upper = [str(x).upper() for x in df_raw.iloc[0].astype(str).values]
+
+    if any('LENS' in c for c in cols_upper):
+        # Los encabezados ya contienen 'LENS' → no hacer nada
+        df = df_raw.copy()
+    elif any('LENS' in v for v in first_row_upper):
+        # La primera fila contiene los nombres de las columnas reales
+        df = df_raw.copy()
+        df.columns = df.iloc[0].astype(str)
+        df = df[1:].reset_index(drop=True)
+    else:
+        # No se detecta LENS en encabezados ni en primera fila → usar df_raw tal cual
+        df = df_raw.copy()
+
+    # -------------------------------
+    # Buscar columnas LENS (case-insensitive)
+    # -------------------------------
+    lens_cols = [c for c in df.columns if 'LENS' in str(c).upper()]
+
+    # Si no se encontraron columnas LENS, intentamos localizar columnas numéricas útiles
+    if not lens_cols:
+        # 1) Tomar columnas cuyo dtype sea numérico
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
+        # 2) Si no hay columnas numéricas por dtype, intentar convertir y contar convertibles
+        if not numeric_cols:
+            possible = []
+            for c in df.columns:
+                # Intenta convertir la columna a numérico y cuenta valores no-NaN
+                ser = pd.to_numeric(df[c], errors='coerce')
+                non_na = ser.dropna().shape[0]
+                if non_na > 0:
+                    possible.append((c, non_na))
+            # Ordenar por la cantidad de datos convertibles (descendente)
+            possible.sort(key=lambda x: x[1], reverse=True)
+            numeric_cols = [c for c, _ in possible]
+
+        # 3) Evitar la primera columna si es texto (habitual: nombre del laboratorio)
+        if len(numeric_cols) > 1 and (not pd.api.types.is_numeric_dtype(df[numeric_cols[0]])):
+            lens_cols = numeric_cols[1:]
+        else:
+            lens_cols = numeric_cols
+
+    # -------------------------------
+    # Convertir cada columna seleccionada a numérico y "aplanar" en un array 1D
+    # -------------------------------
+    datos = []
+    for c in lens_cols:
+        ser = pd.to_numeric(df[c], errors='coerce').dropna().astype(float)
+        if ser.shape[0] > 0:
+            datos.append(ser.values)
+
+    if datos:
+        # Concatenar horizontalmente (si se seleccionaron varias columnas)
+        datos = np.hstack(datos)
+    else:
+        datos = np.array([], dtype=float)
+
+    # Filtrar NaN por seguridad
+    datos = datos[~np.isnan(datos)]
+
+    if datos.size == 0:
+        print(f"[AVISO] Sin datos válidos en '{hoja}' (columnas buscadas: {lens_cols}). Omitida.")
+        continue
+
+    # ============ CÁLCULOS ESTADÍSTICOS ============
+
+    n = int(datos.size)
+    media = float(np.mean(datos))
+    s = float(np.std(datos, ddof=1)) if n > 1 else float('nan')  # desviación estándar muestral
+    sesgo = media - x_ref
+
+    # Si n < 2 no es posible construir IC con t-student
+    if n < 2:
+        lim_inf = np.nan
+        lim_sup = np.nan
+        criterio = "Sin IC (n<2)"
+    else:
+        # Varianza del sesgo: var(media) + u_ref^2  (u_ref = incertidumbre estándar del valor de referencia)
+        var_sesgo = (s ** 2) / n + (u_ref ** 2)
+        uc = math.sqrt(var_sesgo)            # incertidumbre combinada del sesgo
+        tcrit = t.ppf(0.975, n - 1)          # t crítico para IC 95% bilateral
+        margen = tcrit * uc
+        lim_inf, lim_sup = sesgo - margen, sesgo + margen
+        criterio = ("Sesgo no significativo" if (lim_inf <= 0.0 <= lim_sup) else "Sesgo significativo")
+
+    # Desviación estándar global (s_global = s)
+    s_global = s
+
+    # Guardar resultados temporales para su posterior render / inserción
+    tmp_results[hoja] = {
+        "x_ref": x_ref,
+        "sesgo": sesgo,
+        "lim_sup": lim_sup,
+        "lim_inf": lim_inf,
+        "media": media,
+        "criterio": criterio,
+        "n": n,
+        "s_global": s_global,
+    }
+
+# =============== copiar libro y abrir ===============
+# Se crea una copia del libro de entrada y se trabaja sobre la copia para mantener el original intacto.
+shutil.copy(EXCEL_IN, EXCEL_OUT)
+wb = load_workbook(EXCEL_OUT)
+
+# =============== generar PNG e insertar ===============
+for hoja in hojas:
+    # Validación: la hoja debe existir en el archivo destino y debe tener resultados calculados
+    if hoja not in wb.sheetnames or hoja not in tmp_results:
+        continue
+
+    ws = wb[hoja]
+
+    # Calcular el tamaño en pixels que ocupará la imagen según dimensiones de columnas/filas
+    target_w, target_h = range_pixels(ws, anchor_cell_default, cells_wide, cells_high)
+    target_h += extra_header_px  # dejar espacio adicional para el encabezado de la tarjeta
+
+    res = tmp_results[hoja]
+
+    # Título que aparecerá en la tarjeta PNG
+    titulo = f"Análisis del sesgo respecto al promedio (consenso)\n{hoja}"
+
+    criterio_wrapped = wrap_text(res["criterio"], width=28)
+
+    # Pares (Concepto, Valor) que aparecerán en la tarjeta (ordenados y formateados)
+    filas = [
+        # ("Valor de referencia", fmt(res["x_ref"], 6)),  # Omitido visualmente si no se desea
+        ("Promedio global (x̄)", fmt(res["media"], 6)),
+        ("Sesgo (x̄ - x_ref)", fmt(res["sesgo"], 6)),
+        ("Límite superior (IC 95%)", fmt(res["lim_sup"], 6)),
+        ("Límite inferior (IC 95%)", fmt(res["lim_inf"], 6)),
+        ("Desviación estándar (s)", fmt(res["s_global"], 6)),
+        ("Número de datos (n)", fmt(res["n"], 0)),
+        ("Criterio de evaluación", criterio_wrapped),
+    ]
+
+    # Ruta del PNG a generar para esta hoja
+    out_png = os.path.join(carpeta_png, f"{hoja.replace(' ', '_').lower()}_sesgo.png")
+
+    # Renderizar la tarjeta PNG y guardarla
+    render_card_png(titulo, filas, out_png, target_w, target_h, dpi=dpi)
+
+    # Insertar la imagen en la hoja (anclada en anchor_cell_default)
+    img = XLImage(out_png)
+    img.width = target_w
+    img.height = target_h
+    ws.add_image(img, anchor_cell_default)
+
+# Guardar el libro final con las imágenes embebidas
+wb.save(EXCEL_OUT)
+print(f"[OK] Guardado con imágenes compactas en: {EXCEL_OUT}")
