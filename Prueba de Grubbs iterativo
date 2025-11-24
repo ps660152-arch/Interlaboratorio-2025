@@ -1,0 +1,259 @@
+"""
+Análisis Interlaboratorio – Cálculo de Prueba de Grubbs
+Autor: Diego Pastor Sanchez
+Descripción:
+Este script procesa diferentes propiedades fotométricas medidas por múltiples laboratorios 
+(LENS_0, LENS_1, etc.) a partir de un archivo Excel. Para cada hoja se calcula:
+
+- Prueba de Grubbs
+
+
+"""
+import os
+import re
+import unicodedata
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+from openpyxl.drawing.image import Image as OpenpyxlImage  # Para insertar las gráficas en Excel
+
+# ============================================================
+# CONFIGURACIÓN DE ARCHIVOS Y HOJAS A ANALIZAR
+# ============================================================
+
+# Archivo de entrada con mediciones por laboratorio
+Nombre_archivo = '/content/Item 2 estudio ST1 modificado.xlsx'
+
+# Lista de hojas que contienen las distintas magnitudes
+hojas = [
+    'Eficacia Luminosa',
+    'Temperatura de Color',
+    'Flujo luminoso',
+    'Indice de Rendimiento',
+    'Factor de Potencia',
+    'Distorsion Armonica'
+]
+
+# Archivo de salida donde se guardarán los resultados finales y gráficas incrustadas
+salida_excel = '/content/Resultados prueba de Grubbs item 2 .xlsx'
+
+# Carpeta donde se guardarán las gráficas individuales en formato PNG
+outdir_barras_grubbs = '/content/graficas_grubbs_barras'
+os.makedirs(outdir_barras_grubbs, exist_ok=True)
+
+# ============================================================
+# FUNCIÓN AUXILIAR
+# ============================================================
+
+def slugify(s: str) -> str:
+    """
+    Convierte un texto en un nombre seguro para archivos:
+    - Quita acentos
+    - Reemplaza espacios/símbolos por "_"
+    - Convierte todo a minúsculas
+    """
+    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
+    s = re.sub(r'[^a-zA-Z0-9]+', '_', s).strip('_').lower()
+    return s
+
+# ============================================================
+# PROCESO PRINCIPAL: ANÁLISIS ITERATIVO DE GRUBBS POR HOJA
+# ============================================================
+
+writer = pd.ExcelWriter(salida_excel, engine='openpyxl')
+
+# Variables globales opcionales (para análisis final fuera del ciclo)
+resumen = []
+eliminados_global = []
+
+# ------------------------------------------------------------
+# Bucle que recorre cada magnitud (hoja del archivo)
+# ------------------------------------------------------------
+for hoja in hojas:
+    print(f"\nEvaluando hoja: {hoja}")
+
+    # Lectura de la hoja en un DataFrame
+    df = pd.read_excel(Nombre_archivo, sheet_name=hoja)
+
+    # La primera fila contiene encabezados; se asignan y se elimina dicha fila
+    df.columns = df.iloc[0].astype(str)
+    df = df[1:].reset_index(drop=True)
+
+    # Se seleccionan únicamente las columnas correspondientes a laboratorios (LENS_X)
+    lenses_cols = [col for col in df.columns if "LENS" in col]
+
+    if not lenses_cols:
+        print(f"  ⚠️ No se encontraron columnas de laboratorios en la hoja {hoja}.")
+        continue
+
+    # Conversión de todas las columnas a valores numéricos
+    lenses_data = {col: pd.to_numeric(df[col], errors='coerce') for col in lenses_cols}
+
+    # Cálculo de los promedios iniciales por laboratorio
+    promedios_inicial = pd.Series({
+        col: datos.mean(skipna=True)
+        for col, datos in lenses_data.items()
+    })
+
+    # Copia de los promedios para comenzar el proceso iterativo de eliminación por Grubbs
+    promedios = promedios_inicial.copy()
+
+    iteracion = 1
+    eliminados = []  # Lista para guardar laboratorios eliminados en esta hoja
+
+    # ------------------------------------------------------------
+    # PROCESO ITERATIVO: TEST DE GRUBBS PARA DETECTAR OUTLIERS
+    # ------------------------------------------------------------
+    while True:
+        n = len(promedios)
+
+        # Se requieren al menos 3 laboratorios para aplicar Grubbs
+        if n < 3:
+            break
+
+        prom_general = promedios.mean()
+        std_general = promedios.std(ddof=1)
+
+        # Si la desviación estándar es cero o inválida, no se puede evaluar
+        if std_general is None or np.isnan(std_general) or std_general == 0:
+            break
+
+        # Valores mínimo y máximo del conjunto actual
+        valor_min = promedios.min()
+        valor_max = promedios.max()
+
+        # Cálculo del estadístico G para mínimo y máximo
+        Gmin = (prom_general - valor_min) / std_general
+        Gmax = (valor_max - prom_general) / std_general
+
+        # Valor crítico Gc para alfa=0.05 (prueba bilateral)
+        alfa = 0.05
+        alfa_2 = alfa / 2
+        gl = n - 1
+        t_critico = stats.t.ppf(1 - alfa_2, df=gl)
+        Gc = ((n - 1) * t_critico) / np.sqrt(n * (n - 2 + t_critico**2))
+
+        # Determinar si se elimina valor mínimo o máximo
+        eliminar = None
+        tipo = None
+        G_usado = None
+
+        if Gmin > Gc:
+            eliminar = promedios.idxmin()
+            tipo = 'min'
+            G_usado = Gmin
+
+        elif Gmax > Gc:
+            eliminar = promedios.idxmax()
+            tipo = 'max'
+            G_usado = Gmax
+
+        else:
+            # Si ninguno supera el límite crítico, se termina la iteración
+            break
+
+        # Registrar laboratorio eliminado en esta iteración
+        eliminados.append((
+            hoja,                  # Magnitud evaluada
+            eliminar,              # Laboratorio eliminado
+            iteracion,             # Iteración donde se eliminó
+            promedios[eliminar],   # Valor del laboratorio
+            tipo,                  # Tipo (mínimo o máximo)
+            G_usado,               # Valor G calculado
+            Gc                     # Valor crítico utilizado
+        ))
+
+        # Se elimina el laboratorio del conjunto y se continúa con la iteración
+        promedios = promedios.drop(eliminar)
+        iteracion += 1
+
+    # ============================================================
+    # GUARDADO DE RESULTADOS EN EXCEL (TABLA POR HOJA)
+    # ============================================================
+
+    df_resultado = promedios.reset_index()
+    df_resultado.columns = ['Laboratorio', 'Promedio']
+    df_resultado.to_excel(writer, sheet_name=hoja, index=False)
+
+    # ============================================================
+    # GENERACIÓN E INSERCIÓN DE GRÁFICA DE GRUBBS
+    # ============================================================
+    try:
+        # Recalculamos G_i sobre los promedios iniciales (antes del filtrado)
+        mu0 = promedios_inicial.mean()
+        sd0 = promedios_inicial.std(ddof=1)
+
+        if sd0 is not None and not np.isnan(sd0) and sd0 != 0 and len(promedios_inicial) >= 3:
+
+            # Cálculo de los valores G_i individuales
+            Gi = (promedios_inicial - mu0).abs() / sd0
+
+            # Cálculo del G crítico para el conjunto original
+            n0 = len(promedios_inicial)
+            gl0 = n0 - 1
+            tcrit0 = stats.t.ppf(1 - (0.05 / 2), df=gl0)
+            Gc0 = ((n0 - 1) * tcrit0) / np.sqrt(n0 * (n0 - 2 + tcrit0**2))
+
+            # Identificar laboratorios eliminados
+            labs_eliminados = {lab for _, lab, *_ in eliminados}
+
+            # Ordenar por nombre de laboratorio
+            Gi = Gi.reindex(sorted(Gi.index), copy=False)
+
+            # Colorear barras según si el laboratorio fue eliminado
+            colors = ['#d62728' if lab in labs_eliminados else '#1f77b4'
+                      for lab in Gi.index]
+
+            # ------------------------------
+            # Generación de la gráfica
+            # ------------------------------
+            plt.figure(figsize=(10, 5.5))
+            plt.bar(Gi.index, Gi.values, color=colors)
+            plt.axhline(Gc0, color='#c0392b', linewidth=2, label='Valor crítico Gc')
+            plt.title(f'Prueba de Grubbs para {hoja}', fontsize=14)
+            plt.ylabel('Valor G de Grubbs')
+            plt.xticks(rotation=45, ha='right')
+            plt.grid(axis='y', linestyle='--', alpha=0.6)
+
+            # Etiqueta "Eliminado" arriba de cada barra correspondiente
+            if labs_eliminados:
+                ymax = float(np.nanmax(Gi.values))
+                bump = 0.04 * (ymax if ymax > 0 else 1)
+                for i, lab in enumerate(Gi.index):
+                    if lab in labs_eliminados:
+                        plt.text(i, Gi.loc[lab] + bump, 'Eliminado',
+                                 ha='center', va='bottom', fontsize=8, rotation=90)
+
+            # Guardar gráfica como PNG
+            fname = f"grubbs_{slugify(hoja)}.png"
+            path_png = os.path.join(outdir_barras_grubbs, fname)
+            plt.tight_layout()
+            plt.savefig(path_png, dpi=300)
+            plt.close()
+
+            # ------------------------------
+            # Inserción de la imagen en la hoja Excel
+            # ------------------------------
+            ws = writer.sheets[hoja]
+            start_row = len(df_resultado) + 4  # separación de 3 filas debajo de la tabla
+            anchor_cell = f"A{start_row}"
+
+            img = OpenpyxlImage(path_png)
+            img.width = 950
+            img.height = 380
+
+            ws.add_image(img, anchor_cell)
+
+        else:
+            print(f"  ⚠️ No se puede graficar G_i en {hoja} (sd=0, NaN o n<3).")
+
+    except Exception as e:
+        print(f"  ⚠️ Error generando/incrustando gráfica para {hoja}: {e}")
+
+# ============================================================
+# CERRAR EL ARCHIVO EXCEL FINAL
+# ============================================================
+writer.close()
+print("\n✔ Análisis completado y archivo generado.")
